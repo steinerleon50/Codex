@@ -117,14 +117,15 @@ export class WorldRoom {
     if (!force && session.center === center) return;
     session.center = center; const wanted = new Set(), additions = [];
     const pending = new Set(session.chunkQueue.map(c => c.x + ',' + c.z)), r = session.interest || 3;
-    for (let x = cx - r; x <= cx + r; x++) for (let z = cz - r; z <= cz + r; z++) { const key = x + ',' + z; wanted.add(key); if (!session.subscriptions.has(key) || pending.has(key)) additions.push({ x, z, distance: (x - cx) ** 2 + (z - cz) ** 2 }); }
+    for (let x = cx - r; x <= cx + r; x++) for (let z = cz - r; z <= cz + r; z++) { const key = x + ',' + z; wanted.add(key); if (force || !session.subscriptions.has(key) || pending.has(key)) additions.push({ x, z, distance: (x - cx) ** 2 + (z - cz) ** 2 }); }
     for (const key of session.subscriptions) if (!wanted.has(key)) send(session.socket, { type: 'chunk.unsubscribe', key });
     session.subscriptions = wanted; session.chunkQueue = additions.sort((a, b) => a.distance - b.distance);
   }
   events() {
     const events = this.game.events.splice(0); if (!events.length) return;
+    if(events.some(e=>e.type==='structure.ready'))for(const s of this.sessions.values())this.subscribe(s,this.game.players.get(s.identity.user.id),true);
     for (const session of this.sessions.values()) {
-      const visible = events.filter(e => { const p = e.entity || e; return session.subscriptions.has(Math.floor(p.x / 16) + ',' + Math.floor(p.z / 16)); });
+      const visible = events.filter(e => { if(e.type.startsWith('structure.'))return true; const p = e.entity || e; return session.subscriptions.has(Math.floor(p.x / 16) + ',' + Math.floor(p.z / 16)); });
       for (let i = 0; i < visible.length; i += 128) send(session.socket, { type: 'world.delta', events: visible.slice(i, i + 128) });
     }
   }

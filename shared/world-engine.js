@@ -1,4 +1,6 @@
 import { createTerrain } from './terrain.js';
+import { TREE_VERSION, TREE_META, baseBlock, baseEntities, transformedBuilding } from './treehouse-template.js';
+import { sampleLift, planLift, liftOccupant, liftDoorOccupied, liftCollisionBoxes } from './online-lift.js';
 import { ITEMS, BLOCKS, FURNITURE, GameError, requireValue, integer, validItem, makeStack, add, give, consume, damageTool, inventoryAction, returnEscrow, SMELTS, fuelValue } from './inventory.js';
 
 export const PROTOCOL = 1;
@@ -23,7 +25,7 @@ export function playerPublic(p) {
 export function playerPrivate(p) {
   return { ...playerPublic(p), inventory: p.inventory, armor: p.armor, hotbar: p.hotbar,
     cursor: p.cursor, craft: p.craft, craftSize: p.craftSize, container: p.container, hunger: p.hunger,
-    xp: p.xp, air: p.air, mode: p.mode, role: p.role, revision: p.revision, epoch: p.epoch, spawn: p.spawn };
+    xp: p.xp, air: p.air, mode: p.mode, role: p.role, revision: p.revision, epoch: p.epoch, spawn: p.spawn, seat:p.seat || null };
 }
 
 // The store interface is implemented by strongly consistent per-world SQLite.
@@ -39,6 +41,28 @@ export class VoxelWorld {
     if (!store.get('meta', 'world')) store.transaction(() => store.put('meta', 'world', this.meta));
   }
   time() { return mod(this.meta.time + (this.now - this.meta.timeAt) / 1000, 1200); }
+  structures() {
+    const list = this.meta.structures ||= [];
+    if (this.structureList !== list) {
+      this.structureList = list; this.baseEntities = new Map(); this.baseBuckets = new Map();
+      for (const b of list) for (const e of baseEntities(b)) {
+        e.structure = b.uid; this.baseEntities.set(e.uid, e);
+        const key = Math.floor(e.x / 16) + ',' + Math.floor(e.z / 16);
+        if (!this.baseBuckets.has(key)) this.baseBuckets.set(key, []);
+        this.baseBuckets.get(key).push(e);
+      }
+      this.entityBuckets.clear();
+    }
+    return list;
+  }
+  structureComplete(uid) { return this.structures().some(b => b.uid === uid && this.now >= b.startAt + b.duration); }
+  columnEntities(cx, cz) {
+    this.structures();
+    const map = new Map((this.baseBuckets.get(cx + ',' + cz) || []).map(e => [e.uid, e]));
+    for (const e of this.store.nearby(cx,cx,cz,cz)) map.set(e.uid,e);
+    for (const [,r] of this.pendingWrites || []) if(r[0]==='entity' && r[2] && Math.floor(r[2].x/16)===cx && Math.floor(r[2].z/16)===cz) map.set(r[1],r[2]);
+    return [...map.values()].filter(e => e.kind !== 'removed' && (!e.structure || this.structureComplete(e.structure)));
+  }
   getSection(key) {
     if (this.stage?.sections.has(key)) return this.stage.sections.get(key);
     if (!this.sections.has(key)) this.sections.set(key, this.store.get('section', key) || { key, revision: 0, edits: {} });
@@ -49,6 +73,11 @@ export class VoxelWorld {
     if (y < 1) return 11;
     const s = this.getSection(sectionKey(x, y, z)), i = cellIndex(x, y, z);
     if (s.edits[i] !== undefined) return s.edits[i];
+    for (const b of this.structures()) {
+      const [ox,oy,oz] = b.origin, localY = y - oy;
+      if (this.now < b.startAt + b.duration && localY > TREE_META.bounds[1] + (TREE_META.bounds[4] - TREE_META.bounds[1]) * Math.max(0,(this.now-b.startAt)/b.duration)) continue;
+      const id = baseBlock(x-ox,localY,z-oz); if (id !== undefined) return id;
+    }
     if (y >= 112) return 0;
     return this.terrain.generate(Math.floor(x / 16), Math.floor(z / 16)).data[y * 256 + mod(z, 16) * 16 + mod(x, 16)];
   }
@@ -64,12 +93,16 @@ export class VoxelWorld {
     if (this.stage?.entities.has(uid)) return this.stage.entities.get(uid);
     // A deletion inside the current batch must not reload the old durable item.
     const pending = this.pendingWrites?.get('entity:' + uid);
-    if (pending) return pending[2];
-    if (!this.entities.has(uid)) { const entity = this.store.get('entity', uid); if (entity) this.entities.set(uid, entity); }
-    return this.entities.get(uid) || null;
+    if (pending) return pending[2]?.kind==='removed' ? null : pending[2];
+    if (!this.entities.has(uid)) {
+      this.structures(); const base=this.baseEntities.get(uid);
+      if(base) for(const e of this.columnEntities(Math.floor(base.x/16),Math.floor(base.z/16))) this.indexEntity(e);
+      else { const entity = this.store.get('entity', uid); if (entity) this.entities.set(uid, entity); }
+    }
+    const e=this.entities.get(uid); return e?.kind === 'removed' ? null : e || null;
   }
   updateEntity(e) { this.stage.entities.set(e.uid, e); }
-  removeEntity(e) { this.stage.entities.set(e.uid, null); this.stage.events.push({ type: 'entity.remove', uid: e.uid, x: e.x, y: e.y, z: e.z }); }
+  removeEntity(e) { this.stage.entities.set(e.uid, e.structure ? {uid:e.uid,kind:'removed',structure:e.structure,x:e.x,y:e.y,z:e.z} : null); this.stage.events.push({ type: 'entity.remove', uid: e.uid, x: e.x, y: e.y, z: e.z }); }
   indexEntity(e) {
     const key = Math.floor(e.x / 16) + ',' + Math.floor(e.z / 16);
     let bucket = this.entityBuckets.get(key);
@@ -77,17 +110,18 @@ export class VoxelWorld {
     bucket.add(e.uid); this.entities.set(e.uid, e);
   }
   nearby(x, z, range = 16) {
+    this.structures();
     const cx = Math.floor(x / 16), cz = Math.floor(z / 16), r = Math.ceil(range / 16), map = new Map();
     for (let bx = cx - r; bx <= cx + r; bx++) for (let bz = cz - r; bz <= cz + r; bz++) {
       const key = bx + ',' + bz;
       if (!this.entityBuckets.has(key)) {
-        const loaded = this.store.nearby(bx, bx, bz, bz);
+        const loaded = this.columnEntities(bx, bz);
         this.entityBuckets.set(key, new Set());
         for (const e of loaded) this.indexEntity(e);
       }
-      for (const uid of this.entityBuckets.get(key)) { const e = this.entities.get(uid); if (e) map.set(uid, e); }
+      for (const uid of this.entityBuckets.get(key)) { const e = this.entities.get(uid); if (e && e.kind!=='removed') map.set(uid, e); }
     }
-    for (const [uid, e] of this.stage?.entities || []) { if (!e) map.delete(uid); else if (Math.abs(e.x - x) <= range + 16 && Math.abs(e.z - z) <= range + 16) map.set(uid, e); }
+    for (const [uid, e] of this.stage?.entities || []) { if (!e || e.kind==='removed') map.delete(uid); else if (Math.abs(e.x - x) <= range + 16 && Math.abs(e.z - z) <= range + 16) map.set(uid, e); }
     return [...map.values()];
   }
   blockBoxes(x, y, z) {
@@ -108,6 +142,7 @@ export class VoxelWorld {
     const body = [x - radius, y + 0.025, z - radius, x + radius, y + height - 0.025, z + radius];
     for (let by = Math.floor(y); by <= Math.floor(y + height); by++) for (let bz = Math.floor(z - radius); bz <= Math.floor(z + radius); bz++) for (let bx = Math.floor(x - radius); bx <= Math.floor(x + radius); bx++) for (const box of this.blockBoxes(bx, by, bz)) if (overlaps(body, box)) return true;
     for (const e of this.nearby(x, z, 4)) if (e.kind === 'furniture' && e.uid !== ignoreFurniture) for (const box of this.furnitureBoxes(e)) if (overlaps(body, box)) return true;
+    for (const e of this.nearby(x,z,4)) if(e.kind==='lift' && e.uid!==ignoreFurniture) for(const box of liftCollisionBoxes(e,y,this.now)) if(overlaps(body,box)) return true;
     return false;
   }
   canBuild(p) { return ['owner', 'builder'].includes(p.role); }
@@ -131,6 +166,7 @@ export class VoxelWorld {
       if (this.meta.mode === 'creative') [1, 8, 3, 4, 7, 9, 25, 33, 107].forEach((id, i) => { p.inventory[i] = makeStack(id, 64); });
     }
     p = { ...p, name: identity.user.name, skin: identity.user.skin, role: identity.role, mode: this.meta.mode, epoch, vx: 0, vy: 0, vz: 0, lastMove: this.now, lastReceive: this.now, rate: {}, container: null };
+    if(p.lift){const lift=this.entity(p.lift);if(lift?.kind==='lift' && Math.hypot(p.x-lift.x,p.z-lift.z)<1.5){p.y=sampleLift(lift,this.now).y+.24;p.fallStart=p.y;}else p.lift=null;}
     this.players.set(p.id, p); this.store.transaction(() => this.store.put('player', p.id, p)); return p;
   }
   leave(uid) {
@@ -145,6 +181,12 @@ export class VoxelWorld {
   move(uid, a) {
     const p = this.players.get(uid); requireValue(p && !p.dead, 'not_playing'); this.rate(p, 'move', 35);
     coordinates(a, false); for (const key of ['yaw', 'pitch']) requireValue(Number.isFinite(a[key]) && Math.abs(a[key]) < 100000, 'invalid_rotation');
+    let riding = p.lift ? this.entity(p.lift) : null;
+    if (riding?.kind === 'lift' && liftOccupant(riding,p,this.now,1)) {
+      const cab=sampleLift(riding,this.now);
+      if(Math.hypot(a.x-riding.x,a.z-riding.z)<1.45 && Math.abs(a.y-(cab.y+.24))<Math.max(1.2,Math.abs(cab.speed)*1.2)) a={...a,y:cab.y+.24};
+      else {p.lift=null;riding=null;}
+    } else {p.lift=null;riding=null;}
     const elapsed = clamp((this.now - p.lastMove) / 1000, 0.016, 1.5), maxSpeed = p.mode === 'creative' ? 22 : 8.5;
     const horizontal = Math.hypot(a.x - p.x, a.z - p.z), vertical = a.y - p.y;
     p.moveBudget = Math.min(maxSpeed * 1.6, (p.moveBudget ?? maxSpeed * 0.4) + maxSpeed * elapsed);
@@ -154,7 +196,7 @@ export class VoxelWorld {
     requireValue(!a.flight || p.mode === 'creative', 'flight_denied');
     const height = a.crouch || a.state === 'slide' ? 1.5 : 1.8;
     const steps = Math.max(1, Math.ceil(Math.hypot(horizontal, vertical) / 0.35));
-    for (let i = 1; i <= steps; i++) requireValue(!this.collision(p.x + (a.x - p.x) * i / steps, p.y + vertical * i / steps, p.z + (a.z - p.z) * i / steps, 0.27, height - 0.08, p.seat), 'collision_rejected');
+    for (let i = 1; i <= steps; i++) requireValue(!this.collision(p.x + (a.x - p.x) * i / steps, p.y + vertical * i / steps, p.z + (a.z - p.z) * i / steps, 0.27, height - 0.08, p.seat || riding?.uid), 'collision_rejected');
     const grounded = this.collision(a.x, a.y - 0.13, a.z, 0.25, 0.12), water = this.getBlock(a.x, a.y + 0.5, a.z) === 10, ladder = this.getBlock(a.x, a.y + 0.7, a.z) === 58;
     if (p.mode !== 'creative' && !grounded && !water && !ladder && !lift && !p.seat) {
       if (p.airborneSince === undefined) p.airborneSince = this.now;
@@ -229,6 +271,39 @@ export class VoxelWorld {
     if (a.type === 'player.respawn') { requireValue(p.dead, 'not_dead'); returnEscrow(p, this.context()); for (const s of p.inventory.concat(p.armor)) if (s) this.drop(p, s); p.inventory.fill(null); p.armor.fill(null); p.xp = Math.floor(p.xp * 0.5); [p.x, p.y, p.z] = p.spawn; p.vx = p.vy = p.vz = 0; p.health = p.hunger = p.air = 20; p.dead = false; p.hurtUntil = this.now + 3000; return; }
     if (a.type === 'item.pickup') { const e = this.entity(a.uid); requireValue(e?.kind === 'drop' && this.now >= e.pickAt && distance(p, e) <= 2.2, 'pickup_denied'); const n = add(p.inventory, e.stack); if (!n) this.removeEntity(e); else if (n < e.stack.n) this.updateEntity({ ...e, stack: { ...e.stack, n } }); return; }
     requireValue(this.canBuild(p), 'permission_denied');
+    if(a.type==='structure.tree') {
+      requireValue(p.role==='owner' && p.mode==='creative','permission_denied');
+      this.rate(p,'structure',1,30000);
+      requireValue(this.structures().length<4,'structure_limit');
+      let x=integer(a.x ?? Math.floor(p.x-Math.sin(p.yaw)*140),-MAX_COORD+80,MAX_COORD-80);
+      let z=integer(a.z ?? Math.floor(p.z-Math.cos(p.yaw)*140),-MAX_COORD+90,MAX_COORD-90);
+      requireValue(Math.hypot(x-p.x,z-p.z)<260,'out_of_reach');
+      let y=111;while(y>12 && !BLOCKS[this.terrain.generate(Math.floor(x/16),Math.floor(z/16)).data[y*256+mod(z,16)*16+mod(x,16)]]?.solid)y--;
+      y=Math.max(12,y+1);
+      const bounds=TREE_META.bounds.map((v,i)=>v+[x,y,z][i%3]);
+      for(const b of this.structures())requireValue(!overlaps(bounds,transformedBuilding(b).bounds),'structure_overlap');
+      for(const other of this.players.values())requireValue(!overlaps(bounds,[other.x-.3,other.y,other.z-.3,other.x+.3,other.y+other.height,other.z+.3]),'player_in_build_area');
+      const descriptor={uid:crypto.randomUUID(),kind:'tree',version:TREE_VERSION,origin:[x,y,z],startAt:this.now+1800,duration:12000};
+      this.stage.meta={...this.meta,structures:[...this.structures(),descriptor],revision:(this.meta.revision||0)+1};
+      this.stage.events.push({type:'structure.add',structure:descriptor}); return;
+    }
+    if(a.type==='structure.visit') {
+      const b=this.structures().find(b=>b.uid===a.uid)||this.structures()[0];
+      requireValue(b && this.now>=b.startAt+b.duration,'building_in_progress');
+      // A dedicated visit command only reaches a server-defined doorway.
+      const [x,y,z]=transformedBuilding(b).entry;let found=false;
+      for(const [dx,dz] of [[0,0],[0,1],[0,2],[1,0],[-1,0]])if(!this.collision(x+dx,y+.04,z+dz)){p.x=x+dx;p.y=y+.04;p.z=z+dz;found=true;break;}
+      requireValue(found,'destination_blocked');p.vx=p.vy=p.vz=0;p.lastMove=this.now;return;
+    }
+    if(a.type==='lift.call') {
+      const base=this.entity(a.uid);requireValue(base?.kind==='lift','invalid_lift');
+      const floor=integer(a.floor,0,base.floors.length-1), pose=sampleLift(base,this.now);
+      const landing=base.floors.reduce((a,b)=>Math.abs(a.y-p.y)<Math.abs(b.y-p.y)?a:b);
+      requireValue(Math.hypot(p.x-base.x,p.z-base.z)<=6 && (Math.abs(p.y-landing.y)<4 || liftOccupant(base,p,this.now,.3)),'out_of_reach');
+      requireValue(pose.state==='idle','lift_busy');this.rate(p,'lift',2,2000);
+      requireValue(![...this.players.values()].some(other=>liftDoorOccupied(base,other,this.now)),'lift_door_blocked');
+      const motion=planLift(base,base.floors[floor].y,this.now);if(motion)this.updateEntity({...base,y:pose.y,motion});return;
+    }
     if (a.type === 'block.mine') {
       coordinates(a); this.reach(p, { x: a.x + 0.5, y: a.y + 0.5, z: a.z + 0.5 });
       const id = this.getBlock(a.x, a.y, a.z), b = BLOCKS[id]; requireValue(id && !b.unbreakable, 'unbreakable');
@@ -281,7 +356,15 @@ export class VoxelWorld {
       else { const key = a.key || (d.storage || e.furnitureType === 'door' ? 'open' : 'on'); requireValue(['open', 'on', 'recline'].includes(key), 'invalid_state'); e.state[key] = !e.state[key]; }
       this.updateEntity(e); return;
     }
-    if (a.type === 'player.stand') { p.seat = null; p.y += 0.2; return; }
+    if (a.type === 'player.stand') {
+      requireValue(p.seat,'not_seated');const e=this.entity(p.seat);requireValue(e?.kind==='furniture','invalid_furniture');
+      const d=FURNITURE[e.furnitureType],size=d.size,angle=e.q*Math.PI/2,c=Math.cos(angle),s=Math.sin(angle);let found=false;
+      for(const [lx,lz] of [[0,size[2]/2+.6],[size[0]/2+.6,0],[-size[0]/2-.6,0],[0,-size[2]/2-.6]]) {
+        const x=e.x+c*lx+s*lz,z=e.z-s*lx+c*lz,y=e.y+.04;
+        if(!this.collision(x,y,z)){p.x=x;p.y=y;p.z=z;found=true;break;}
+      }
+      requireValue(found,'destination_blocked');p.seat=null;p.state='idle';p.vx=p.vy=p.vz=0;p.lastMove=this.now;return;
+    }
     if (a.type === 'tnt.prime') {
       coordinates(a); this.reach(p, a, 8); requireValue(this.getBlock(a.x, a.y, a.z) === 53, 'not_tnt');
       requireValue(p.mode === 'creative' || p.inventory[p.hotbar]?.id === 146, 'requires_flint');
@@ -301,10 +384,18 @@ export class VoxelWorld {
   snapshotChunk(cx, cz) {
     integer(cx, -125000, 125000); integer(cz, -125000, 125000);
     const sections = this.store.sections(cx, cz);
-    return { type: 'chunk.snapshot', cx, cz, sections, entities: this.store.nearby(cx, cx, cz, cz) };
+    return { type: 'chunk.snapshot', cx, cz, sections, entities: this.columnEntities(cx, cz) };
   }
   tick(now) {
-    this.now = now; const dt = Math.min(0.25, (now - this.lastTick) / 1000); this.lastTick = now;
+    const before=this.lastTick;this.now = now; const dt = Math.min(0.25, (now - this.lastTick) / 1000); this.lastTick = now;
+    this.completedStructures ||= new Set();
+    for(const b of this.structures())if(now>=b.startAt+b.duration && !this.completedStructures.has(b.uid)){
+      this.completedStructures.add(b.uid);this.entityBuckets.clear();this.events.push({type:'structure.ready',structure:b});
+    }
+    const elevators=[...this.baseEntities.values()].filter(e=>e.kind==='lift' && this.structureComplete(e.structure));
+    for(const base of elevators){const lift=this.entity(base.uid)||base, old=sampleLift(lift,before), current=sampleLift(lift,now);
+      for(const p of this.players.values())if(liftOccupant(lift,p,before,.04)) {p.y+=current.y-old.y;p.vy=0;p.lift=lift.uid;p.fallStart=p.y;}
+    }
     for (const p of this.players.values()) {
       if (p.mode === 'creative' || p.dead) continue;
       p.exhaustion += dt * 0.009;
