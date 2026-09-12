@@ -1,0 +1,11 @@
+{
+  "name": "aurelia-realtime-deployment",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "scripts": {
+    "start": "node --max-old-space-size=192 room-server/server.js"
+  }
+}
