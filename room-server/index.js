@@ -56,7 +56,13 @@ export class WorldRoom {
         send(socket, { type: 'auth.renewed' }); return;
       }
       await this.flushMutations();
-      if (existing) { this.game.leave(identity.user.id); existing.socket.close(4009, 'Opened on another device'); }
+      if (existing) {
+        this.game.leave(identity.user.id);
+        // Some intermediaries delay or omit close codes. Stop the old client
+        // explicitly before closing, so it cannot reconnect and steal the session.
+        send(existing.socket, { type: 'session.replaced' });
+        existing.socket.close(4009, 'Opened on another device');
+      }
       const epoch = crypto.randomUUID();
       const p = await this.run(() => this.game.join(identity, epoch));
       await this.durable();
