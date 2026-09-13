@@ -256,7 +256,7 @@ export class VoxelWorld {
       if (stage.meta) this.meta = stage.meta;
       this.players.set(uid, p); this.events.push(...stage.events);
       for (const e of stage.entities.values()) if (e) this.events.push({ type: 'entity.update', entity: e });
-      return { type: 'ack', actionId: a.actionId, player: playerPrivate(p), container: p.container ? this.entity(p.container) : null };
+      return { type: 'ack', actionId: a.actionId, effects: stage.events.length+stage.entities.size<=16 ? [...stage.events.filter(e=>e.type==='block.update'||e.type==='entity.remove'), ...[...stage.entities.values()].filter(Boolean).map(entity=>({type:'entity.update',entity}))] : [], player: playerPrivate(p), container: p.container ? this.entity(p.container) : null };
     } finally { this.stage = null; }
   }
   beginBatch() { this.pendingWrites = new Map(); }

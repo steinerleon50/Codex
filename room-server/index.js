@@ -2,6 +2,21 @@ import { VoxelWorld, playerPrivate, playerPublic, PROTOCOL } from '../shared/wor
 import { GameError } from '../shared/inventory.js';
 
 const MAX_PLAYERS = 8;
+const MAX_ACTION_BATCH = 12;
+function batchEntries(msg) {
+  if (!Array.isArray(msg.actions) || !msg.actions.length || msg.actions.length > MAX_ACTION_BATCH) throw new GameError('invalid_batch');
+  const seen = new Set();
+  for (const a of msg.actions) {
+    if (!a || Array.isArray(a) || typeof a.type !== 'string' || !/^[a-z][a-z0-9.]{1,63}$/.test(a.type) || ['actions.batch', 'auth', 'player.state', 'interest', 'ping', 'chat.message'].includes(a.type) || typeof a.actionId !== 'string' || !/^[a-zA-Z0-9:_-]{1,80}$/.test(a.actionId) || seen.has(a.actionId)) throw new GameError('invalid_batch');
+    seen.add(a.actionId);
+  }
+  return msg.actions;
+}
+const actionCost = msg => msg.type === 'actions.batch' ? Math.max(1, Math.min(MAX_ACTION_BATCH, msg.actions?.length || 1)) : 1;
+function errorReplies(msg, code, player) {
+  const actions = msg.type === 'actions.batch' && Array.isArray(msg.actions) && msg.actions.length ? msg.actions.slice(0, MAX_ACTION_BATCH) : [msg];
+  return actions.map(a => ({ type: 'error', code, actionId: typeof a?.actionId === 'string' ? a.actionId.slice(0, 80) : undefined, player }));
+}
 const send = (socket, value) => { if (socket.readyState !== 1) return; if (socket.bufferedAmount > 2097152) { socket.close(1013, 'Slow connection; reconnect to resync'); return; } try { socket.send(JSON.stringify(value)); } catch {} };
 
 export class WorldRoom {
@@ -69,7 +84,7 @@ export class WorldRoom {
       if (socket.readyState !== 1) { this.game.leave(p.id); await this.durable(); return; }
       const session = { socket, identity, epoch, subscriptions: new Set(), expiresAt: Date.now() + 90000, lastSent: '', awaitingAuth: false, chunkQueue: [], interest: 3 };
       this.sessions.set(p.id, session); this.attachments.set(socket, { identity, epoch, world: identity.world.id }); this.pending.delete(socket);
-      send(socket, { type: 'world.welcome', protocol: PROTOCOL, world: { ...this.game.meta, time: this.game.time() }, player: playerPrivate(p), maxPlayers: MAX_PLAYERS, serverTime: Date.now() });
+      send(socket, { type: 'world.welcome', capabilities: {actionBatch:true}, protocol: PROTOCOL, world: { ...this.game.meta, time: this.game.time() }, player: playerPrivate(p), maxPlayers: MAX_PLAYERS, serverTime: Date.now() });
       this.subscribe(session, p, true); this.start();
     } catch (error) { if (!(error instanceof GameError)) this.fatal(error); throw error; }
   }
@@ -95,7 +110,7 @@ export class WorldRoom {
         if (session.expiresAt < Date.now()) throw new GameError('authentication_required');
         const game = this.game; game.now = Date.now(); game.rate(game.players.get(uid), 'message', 90);
         if (msg.type === 'ping') { send(socket, { type: 'pong', sent: Number.isFinite(msg.sent) ? msg.sent : null, serverTime: Date.now() }); return; }
-        if (msg.type === 'player.state') { await this.run(() => game.move(uid, msg)); this.subscribe(session, game.players.get(uid)); return; }
+        if (msg.type === 'player.state') { if(this.mutations.length)await this.flushMutations(); await this.run(() => game.move(uid, msg)); this.subscribe(session, game.players.get(uid)); return; }
         if (msg.type === 'interest') { game.rate(game.players.get(uid), 'interest', 3); session.interest = Math.max(2, Math.min(5, Math.floor(Number(msg.radius) || 3))); this.subscribe(session, game.players.get(uid), true); return; }
         if (msg.type === 'chat.message') {
           game.rate(game.players.get(uid), 'chat', 5, 10000);
@@ -103,14 +118,15 @@ export class WorldRoom {
           const event = { type: 'chat.message', id: crypto.randomUUID(), name: game.players.get(uid).name, text: msg.text.trim().replace(/[\x00-\x1f]/g, ''), time: Date.now() };
           for (const other of this.sessions.values()) send(other.socket, event); return;
         }
-        if (this.mutations.length >= 256) throw new GameError('server_busy');
+        if (msg.type === 'actions.batch') batchEntries(msg);
+        if (this.mutations.reduce((n, entry) => n + actionCost(entry.msg), 0) + actionCost(msg) > 256) throw new GameError('server_busy');
         this.mutations.push({ uid, msg, socket });
       } catch (error) {
         if (!(error instanceof GameError)) { this.fatal(error); return; }
         const p = this.game?.players.get(uid);
-        send(socket, { type: 'error', code: error.code, actionId: msg.actionId, player: p ? playerPrivate(p) : undefined });
+        for (const reply of errorReplies(msg, error.code, p ? playerPrivate(p) : undefined)) send(socket, reply);
       }
-    }).catch(error => { if (!this.failed) send(socket, { type: 'error', code: error.code || 'server_busy' }); });
+    }).catch(error => { if (!this.failed) for (const reply of errorReplies(msg, error.code || 'server_busy')) send(socket, reply); });
   }
   subscribe(session, p, force = false) {
     const cx = Math.floor(p.x / 16), cz = Math.floor(p.z / 16), center = cx + ',' + cz;
@@ -131,13 +147,43 @@ export class WorldRoom {
   }
   async flushMutations() {
     if (!this.mutations.length) return;
-    const queue = this.mutations.splice(0, 32), replies = []; this.game.beginBatch();
+    const queue = [], replies = []; let count = 0;
+    // Bound actual actions, not envelope count, and never split one client batch.
+    while (this.mutations.length && count + actionCost(this.mutations[0].msg) <= 32) {
+      const entry = this.mutations.shift(); count += actionCost(entry.msg); queue.push(entry);
+    }
+    this.game.beginBatch();
     for (const { uid, msg, socket } of queue) {
       if (this.sessions.get(uid)?.socket !== socket) continue;
-      try { replies.push([socket, await this.run(() => this.game.action(uid, msg))]); }
-      catch (error) {
+      let actions;
+      try {
+        actions = msg.type === 'actions.batch' ? batchEntries(msg) : [msg];
+        if (msg.type === 'actions.batch') {
+          const p = this.game.players.get(uid);
+          if (!p) throw new GameError('not_playing');
+          if (msg.epoch !== p.epoch) throw new GameError('superseded_session');
+          if (!Number.isSafeInteger(msg.revision) || msg.revision !== p.revision) throw new GameError('stale_revision');
+        }
+      } catch (error) {
         if (!(error instanceof GameError)) throw error;
-        replies.push([socket, { type: 'error', code: error.code, actionId: msg.actionId, player: playerPrivate(this.game.players.get(uid)) }]);
+        const p = this.game.players.get(uid);
+        for (const reply of errorReplies(msg, error.code, p ? playerPrivate(p) : undefined)) replies.push([socket, reply]);
+        continue;
+      }
+      let rejected = false;
+      for (const action of actions) {
+        const p = this.game.players.get(uid);
+        if (rejected) { replies.push([socket, { type: 'error', code: 'dependency_rejected', actionId: action.actionId, player: playerPrivate(p) }]); continue; }
+        try {
+          // Identity is from the authenticated socket. Envelope revision guards
+          // the whole ordered intent stream; inner epoch/revision cannot forge it.
+          const request = msg.type === 'actions.batch' ? { ...action, epoch: msg.epoch, revision: p.revision } : action;
+          replies.push([socket, await this.run(() => this.game.action(uid, request))]);
+        } catch (error) {
+          if (!(error instanceof GameError)) throw error;
+          rejected = true;
+          replies.push([socket, { type: 'error', code: error.code, actionId: action.actionId, player: playerPrivate(this.game.players.get(uid)) }]);
+        }
       }
     }
     this.game.flushBatch(); await this.durable();
