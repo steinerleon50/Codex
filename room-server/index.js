@@ -108,7 +108,7 @@ export class WorldRoom {
       if (msg.type === 'player.state') { msg = session.latestMove; session.moveQueued = false; }
       try {
         if (session.expiresAt < Date.now()) throw new GameError('authentication_required');
-        const game = this.game; game.now = Date.now(); game.rate(game.players.get(uid), 'message', 90);
+        const game = this.game; game.now = Date.now();
         if (msg.type === 'ping') { send(socket, { type: 'pong', sent: Number.isFinite(msg.sent) ? msg.sent : null, serverTime: Date.now() }); return; }
         if (msg.type === 'player.state') { if(this.mutations.length)await this.flushMutations(); await this.run(() => game.move(uid, msg)); this.subscribe(session, game.players.get(uid)); return; }
         if (msg.type === 'interest') { game.rate(game.players.get(uid), 'interest', 3); session.interest = Math.max(2, Math.min(5, Math.floor(Number(msg.radius) || 3))); this.subscribe(session, game.players.get(uid), true); return; }

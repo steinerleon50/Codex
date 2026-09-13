@@ -179,7 +179,7 @@ export class VoxelWorld {
     requireValue(++r.n <= max, 'rate_limited');
   }
   move(uid, a) {
-    const p = this.players.get(uid); requireValue(p && !p.dead, 'not_playing'); this.rate(p, 'move', 35);
+    const p = this.players.get(uid); requireValue(p && !p.dead, 'not_playing');
     coordinates(a, false); for (const key of ['yaw', 'pitch']) requireValue(Number.isFinite(a[key]) && Math.abs(a[key]) < 100000, 'invalid_rotation');
     let riding = p.lift ? this.entity(p.lift) : null;
     if (riding?.kind === 'lift' && liftOccupant(riding,p,this.now,1)) {
@@ -187,26 +187,18 @@ export class VoxelWorld {
       if(Math.hypot(a.x-riding.x,a.z-riding.z)<1.45 && Math.abs(a.y-(cab.y+.24))<Math.max(1.2,Math.abs(cab.speed)*1.2)) a={...a,y:cab.y+.24};
       else {p.lift=null;riding=null;}
     } else {p.lift=null;riding=null;}
-    const elapsed = clamp((this.now - p.lastMove) / 1000, 0.016, 1.5), maxSpeed = p.mode === 'creative' ? 22 : 8.5;
+    // Friends-only movement policy: the original client owns movement and collision.
+    // Keep finite/bounded coordinates above, but do not reject speed, flight or paths.
+    const elapsed = clamp((this.now - p.lastMove) / 1000, 0.016, 1.5);
     const horizontal = Math.hypot(a.x - p.x, a.z - p.z), vertical = a.y - p.y;
-    p.moveBudget = Math.min(maxSpeed * 1.6, (p.moveBudget ?? maxSpeed * 0.4) + maxSpeed * elapsed);
-    requireValue(horizontal <= p.moveBudget, 'movement_rejected');
-    const lift = p.lift ? this.entity(p.lift) : null, liftSpeed = lift ? 30 : 0;
-    requireValue(horizontal <= maxSpeed * elapsed + 0.6 && vertical <= (liftSpeed || (p.mode === 'creative' ? 22 : 9)) * elapsed + 0.75 && vertical >= -48 * elapsed - 1, 'movement_rejected');
-    requireValue(!a.flight || p.mode === 'creative', 'flight_denied');
-    const height = a.crouch || a.state === 'slide' ? 1.5 : 1.8;
-    const steps = Math.max(1, Math.ceil(Math.hypot(horizontal, vertical) / 0.35));
-    for (let i = 1; i <= steps; i++) requireValue(!this.collision(p.x + (a.x - p.x) * i / steps, p.y + vertical * i / steps, p.z + (a.z - p.z) * i / steps, 0.27, height - 0.08, p.seat || riding?.uid), 'collision_rejected');
-    const grounded = this.collision(a.x, a.y - 0.13, a.z, 0.25, 0.12), water = this.getBlock(a.x, a.y + 0.5, a.z) === 10, ladder = this.getBlock(a.x, a.y + 0.7, a.z) === 58;
-    if (p.mode !== 'creative' && !grounded && !water && !ladder && !lift && !p.seat) {
-      if (p.airborneSince === undefined) p.airborneSince = this.now;
-      requireValue(this.now - p.airborneSince < 1500 || vertical < -0.03, 'flight_denied');
-    } else p.airborneSince = undefined;
-    if (grounded && !p.grounded && p.mode !== 'creative' && !water && !lift) this.hurt(p, Math.max(0, Math.floor((p.fallStart || p.y) - a.y - 3)), 'fall');
-    if (grounded || water || lift) p.fallStart = a.y; else p.fallStart = Math.max(p.fallStart || a.y, a.y);
+    const lift = riding, height = a.crouch || a.state === 'slide' ? 1.5 : 1.8;
+    const grounded = !a.flight && this.collision(a.x, a.y - 0.13, a.z, 0.25, 0.12);
+    const water = this.getBlock(a.x, a.y + 0.5, a.z) === 10;
+    if (grounded && !p.grounded && p.mode !== 'creative' && !p.flight && !a.flight && !water && !lift) this.hurt(p, Math.max(0, Math.floor((p.fallStart || p.y) - a.y - 3)), 'fall');
+    if (grounded || water || lift || a.flight) p.fallStart = a.y; else p.fallStart = Math.max(p.fallStart || a.y, a.y);
     p.vx = (a.x - p.x) / elapsed; p.vy = vertical / elapsed; p.vz = (a.z - p.z) / elapsed;
     p.x = a.x; p.y = a.y; p.z = a.z; p.yaw = mod(a.yaw + Math.PI, Math.PI * 2) - Math.PI; p.pitch = clamp(a.pitch, -1.55, 1.55);
-    p.moveBudget -= horizontal; p.height = height; p.flight = !!a.flight && p.mode === 'creative'; p.grounded = grounded;
+    p.height = height; p.flight = !!a.flight; p.grounded = grounded;
     p.state = p.seat ? 'sitting' : water ? 'swimming' : a.state === 'slide' && horizontal / elapsed > 3 ? 'slide' : !grounded ? (vertical > 0 ? 'jump' : 'fall') : a.crouch ? 'crouch' : horizontal > 0.01 ? (horizontal / elapsed > 5 ? 'sprint' : 'walk') : 'idle';
     p.exhaustion += horizontal * (p.state === 'sprint' ? 0.08 : 0.018); p.lastMove = this.now; p.lastReceive = this.now;
     return playerPublic(p);
@@ -239,7 +231,7 @@ export class VoxelWorld {
     requireValue(a.epoch === original.epoch, 'superseded_session');
     if (original.recent.includes(a.actionId)) return { type: 'ack', actionId: a.actionId, duplicate: true, player: playerPrivate(original) };
     requireValue(a.revision === original.revision, 'stale_revision');
-    this.rate(original, 'action', 50);
+    // Normal actions are queued/batched for capacity, never rejected for click speed.
     const p = structuredClone(original); this.stage = { sections: new Map(), entities: new Map(), events: [], meta: null };
     try {
       this.reduce(p, a);
