@@ -241,6 +241,11 @@ export class VoxelWorld {
       for (const [key, value] of stage.entities) writes.push(['entity', key, value]);
       if (stage.meta) writes.push(['meta', 'world', stage.meta]);
       writes.push(['player', uid, p]);
+      // Log only successfully reduced actions, in the same durable transaction.
+      const blocks=stage.events.filter(e=>e.type==='block.update').map(e=>({x:e.x,y:e.y,z:e.z,id:e.id}));
+      if(blocks.length || /^(structure\.|furniture\.|owner\.|player\.respawn)/.test(a.type)) {
+        for(let start=0;start<Math.max(1,blocks.length);start+=128){const key=crypto.randomUUID();writes.push(['audit',key,{uid,at:this.now,action:a.type,blocks:blocks.slice(start,start+128)}]);}
+      }
       if (this.pendingWrites) for (const [kind, key, value] of writes) this.pendingWrites.set(kind + ':' + key, [kind, key, value]);
       else this.store.transaction(() => { for (const [kind, key, value] of writes) if (value === null) this.store.delete(kind, key); else this.store.put(kind, key, value); });
       for (const [key, section] of stage.sections) this.sections.set(key, section);

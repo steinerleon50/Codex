@@ -1,3 +1,4 @@
+import { ShadowStore } from './shadow-store.js';
 import { VoxelWorld, playerPrivate, playerPublic, PROTOCOL } from '../shared/world-engine.js';
 import { GameError } from '../shared/inventory.js';
 
@@ -66,6 +67,7 @@ export class WorldRoom {
       const existing = this.sessions.get(identity.user.id);
       if (!existing && this.sessions.size >= MAX_PLAYERS) throw new GameError('world_full');
       if (existing?.socket === socket) {
+        if(existing.identity.user.moderation!==identity.user.moderation||existing.identity.user.adminRole!==identity.user.adminRole){socket.close(1012,'Permissions updated; reconnect');return;}
         existing.identity = identity; existing.expiresAt = Date.now() + 90000; existing.awaitingAuth = false;
         const p = this.game.players.get(identity.user.id); p.role = identity.role; p.mode = identity.world.mode;
         send(socket, { type: 'auth.renewed' }); return;
@@ -80,12 +82,15 @@ export class WorldRoom {
       }
       const epoch = crypto.randomUUID();
       const p = await this.run(() => this.game.join(identity, epoch));
+      await this.run(()=>this.store.transaction(()=>this.store.put('audit',crypto.randomUUID(),{uid:p.id,at:Date.now(),action:'session.join',blocks:[]})));
       await this.durable();
       if (socket.readyState !== 1) { this.game.leave(p.id); await this.durable(); return; }
-      const session = { socket, identity, epoch, subscriptions: new Set(), expiresAt: Date.now() + 90000, lastSent: '', awaitingAuth: false, chunkQueue: [], interest: 3 };
+      let sim=null;
+      if(identity.user.moderation==='shadow'){sim=await this.run(()=>new VoxelWorld(new ShadowStore(this.store,p.id),this.game.meta));await this.store.run?.(()=>sim.join(identity,epoch),sim);if(!sim.players.has(p.id))sim.join(identity,epoch);await this.durable();}
+      const session = { sim, socket, identity, epoch, subscriptions: new Set(), expiresAt: Date.now() + 90000, lastSent: '', awaitingAuth: false, chunkQueue: [], interest: 3 };
       this.sessions.set(p.id, session); this.attachments.set(socket, { identity, epoch, world: identity.world.id }); this.pending.delete(socket);
-      send(socket, { type: 'world.welcome', capabilities: {actionBatch:true}, protocol: PROTOCOL, world: { ...this.game.meta, time: this.game.time() }, player: playerPrivate(p), maxPlayers: MAX_PLAYERS, serverTime: Date.now() });
-      this.subscribe(session, p, true); this.start();
+      send(socket, { type: 'world.welcome', capabilities: {actionBatch:true,adminRole:identity.user.adminRole||null}, protocol: PROTOCOL, world: { ...this.game.meta, time: this.game.time() }, player: playerPrivate(sim?.players.get(p.id)||p), maxPlayers: MAX_PLAYERS, serverTime: Date.now() });
+      this.subscribe(session,sim?.players.get(p.id)||p,true); this.start();for(const other of this.sessions.values())send(other.socket,{type:'presence',world:true,players:[...this.game.players.values()].map(p=>({id:p.id,name:p.name}))});
     } catch (error) { if (!(error instanceof GameError)) this.fatal(error); throw error; }
   }
   webSocketMessage(socket, raw) {
@@ -108,15 +113,24 @@ export class WorldRoom {
       if (msg.type === 'player.state') { msg = session.latestMove; session.moveQueued = false; }
       try {
         if (session.expiresAt < Date.now()) throw new GameError('authentication_required');
-        const game = this.game; game.now = Date.now();
+        const game = session.sim||this.game; game.now = Date.now();
         if (msg.type === 'ping') { send(socket, { type: 'pong', sent: Number.isFinite(msg.sent) ? msg.sent : null, serverTime: Date.now() }); return; }
-        if (msg.type === 'player.state') { if(this.mutations.length)await this.flushMutations(); await this.run(() => game.move(uid, msg)); this.subscribe(session, game.players.get(uid)); return; }
+        if (msg.type === 'player.state') { if(this.mutations.length)await this.flushMutations(); await (this.store.run?this.store.run(()=>game.move(uid,msg),game):game.move(uid,msg));if(session.sim){const pub=this.game.players.get(uid),priv=game.players.get(uid);for(const k of ['x','y','z','yaw','pitch','vx','vy','vz','flight','state'])pub[k]=priv[k];} this.subscribe(session, game.players.get(uid)); return; }
         if (msg.type === 'interest') { game.rate(game.players.get(uid), 'interest', 3); session.interest = Math.max(2, Math.min(5, Math.floor(Number(msg.radius) || 3))); this.subscribe(session, game.players.get(uid), true); return; }
         if (msg.type === 'chat.message') {
           game.rate(game.players.get(uid), 'chat', 5, 10000);
           if (typeof msg.text !== 'string' || !msg.text.trim() || msg.text.length > 300) throw new GameError('invalid_chat');
           const event = { type: 'chat.message', id: crypto.randomUUID(), name: game.players.get(uid).name, text: msg.text.trim().replace(/[\x00-\x1f]/g, ''), time: Date.now() };
-          for (const other of this.sessions.values()) send(other.socket, event); return;
+          for (const other of this.sessions.values()) if(!session.sim||other===session)send(other.socket, event); return;
+        }
+        if(msg.type==='admin.teleport') {
+          if(!session.identity.user.adminRole)throw new GameError('permission_denied');
+          const target=this.game.players.get(msg.userId);if(!target)throw new GameError('not_playing');
+          const moving=msg.bring?target:this.game.players.get(uid), destination=msg.bring?this.game.players.get(uid):target;
+          moving.x=destination.x+1.5;moving.y=destination.y;moving.z=destination.z;moving.flight=true;moving.seat=null;moving.lift=null;moving.vx=moving.vy=moving.vz=0;
+          const ts=this.sessions.get(moving.id);if(ts.sim){const q=ts.sim.players.get(moving.id);Object.assign(q,{x:moving.x,y:moving.y,z:moving.z,flight:true,seat:null,lift:null});}
+          await this.run(()=>this.store.transaction(()=>{this.store.put('player',moving.id,moving);this.store.put('audit',crypto.randomUUID(),{uid,at:Date.now(),action:'admin.teleport',target:moving.id,blocks:[]});}));await this.durable();
+          send(ts.socket,{type:'admin.position',player:playerPrivate(ts.sim?.players.get(moving.id)||moving)});send(socket,{type:'admin.done'});this.subscribe(ts,moving,true);return;
         }
         if (msg.type === 'actions.batch') batchEntries(msg);
         if (this.mutations.reduce((n, entry) => n + actionCost(entry.msg), 0) + actionCost(msg) > 256) throw new GameError('server_busy');
@@ -141,6 +155,7 @@ export class WorldRoom {
     const events = this.game.events.splice(0); if (!events.length) return;
     if(events.some(e=>e.type==='structure.ready'))for(const s of this.sessions.values())this.subscribe(s,this.game.players.get(s.identity.user.id),true);
     for (const session of this.sessions.values()) {
+      if(session.sim){session.sim.sections.clear();session.sim.entities.clear();session.sim.entityBuckets.clear();this.subscribe(session,session.sim.players.get(session.identity.user.id),true);continue;}
       const visible = events.filter(e => { if(e.type.startsWith('structure.'))return true; const p = e.entity || e; return session.subscriptions.has(Math.floor(p.x / 16) + ',' + Math.floor(p.z / 16)); });
       for (let i = 0; i < visible.length; i += 128) send(session.socket, { type: 'world.delta', events: visible.slice(i, i + 128) });
     }
@@ -155,39 +170,40 @@ export class WorldRoom {
     this.game.beginBatch();
     for (const { uid, msg, socket } of queue) {
       if (this.sessions.get(uid)?.socket !== socket) continue;
+      const session=this.sessions.get(uid), game=session.sim||this.game;
       let actions;
       try {
         actions = msg.type === 'actions.batch' ? batchEntries(msg) : [msg];
         if (msg.type === 'actions.batch') {
-          const p = this.game.players.get(uid);
+          const p = game.players.get(uid);
           if (!p) throw new GameError('not_playing');
           if (msg.epoch !== p.epoch) throw new GameError('superseded_session');
           if (!Number.isSafeInteger(msg.revision) || msg.revision !== p.revision) throw new GameError('stale_revision');
         }
       } catch (error) {
         if (!(error instanceof GameError)) throw error;
-        const p = this.game.players.get(uid);
+        const p = game.players.get(uid);
         for (const reply of errorReplies(msg, error.code, p ? playerPrivate(p) : undefined)) replies.push([socket, reply]);
         continue;
       }
       let rejected = false;
       for (const action of actions) {
-        const p = this.game.players.get(uid);
+        const p = game.players.get(uid);
         if (rejected) { replies.push([socket, { type: 'error', code: 'dependency_rejected', actionId: action.actionId, player: playerPrivate(p) }]); continue; }
         try {
           // Identity is from the authenticated socket. Envelope revision guards
           // the whole ordered intent stream; inner epoch/revision cannot forge it.
           const request = msg.type === 'actions.batch' ? { ...action, epoch: msg.epoch, revision: p.revision } : action;
-          replies.push([socket, await this.run(() => this.game.action(uid, request))]);
+          replies.push([socket, await (this.store.run?this.store.run(()=>game.action(uid,request),game):game.action(uid,request))]);
         } catch (error) {
           if (!(error instanceof GameError)) throw error;
           rejected = true;
-          replies.push([socket, { type: 'error', code: error.code, actionId: action.actionId, player: playerPrivate(this.game.players.get(uid)) }]);
+          replies.push([socket, { type: 'error', code: error.code, actionId: action.actionId, player: playerPrivate(game.players.get(uid)) }]);
         }
       }
     }
     this.game.flushBatch(); await this.durable();
-    for (const [socket, value] of replies) send(socket, value); this.events();
+    for (const [socket, value] of replies) send(socket, value); for(const session of this.sessions.values())if(session.sim&&session.sim.events.length)send(session.socket,{type:'world.delta',events:session.sim.events.splice(0)});this.events();
   }
   start() {
     if (this.timer) return;
@@ -204,13 +220,18 @@ export class WorldRoom {
       if (session.expiresAt < Date.now()) { session.socket.close(4001, 'Session expired'); continue; }
       if (session.expiresAt - Date.now() < 45000 && !session.awaitingAuth) { session.awaitingAuth = true; send(session.socket, { type: 'auth.renew' }); }
       for (let i = 0; i < 2 && session.chunkQueue.length; i++) {
-        const c = session.chunkQueue.shift(); if (session.subscriptions.has(c.x + ',' + c.z)) this.sendChunk(session.socket, await this.run(() => this.game.snapshotChunk(c.x, c.z)));
+        const c = session.chunkQueue.shift(); if (session.subscriptions.has(c.x + ',' + c.z)) this.sendChunk(session.socket, await (this.store.run?this.store.run(()=>(session.sim||this.game).snapshotChunk(c.x,c.z),session.sim||this.game):(session.sim||this.game).snapshotChunk(c.x,c.z)));
       }
       if (this.tickCount % 2 === 0) {
-        const players = [...this.game.players.values()].filter(p => p.id !== uid && session.subscriptions.has(Math.floor(p.x / 16) + ',' + Math.floor(p.z / 16))).map(playerPublic), encoded = JSON.stringify(players);
+        const players = [...this.game.players.values()].filter(p => p.id !== uid).map(playerPublic), encoded = JSON.stringify(players);
         if (encoded !== session.lastSent || this.tickCount % 40 === 0) { send(session.socket, { type: 'players.snapshot', players, serverTime: Date.now() }); session.lastSent = encoded; }
       }
-      if (this.tickCount % 100 === 0) send(session.socket, { type: 'world.time', time: this.game.time(), weather: this.game.meta.weather, player: playerPrivate(this.game.players.get(uid)), savedAt: this.game.lastSave });
+      if (this.tickCount % 100 === 0) send(session.socket, { type: 'world.time', time: this.game.time(), weather: this.game.meta.weather, player: playerPrivate((session.sim||this.game).players.get(uid)), savedAt: this.game.lastSave });
+    }
+    if(this.tickCount%100===0){
+      const players=[...this.game.players.values()].map(p=>({id:p.id,name:p.name,x:p.x,y:p.y,z:p.z}));
+      for(const session of this.sessions.values())send(session.socket,{type:'presence',players:players.map(({id,name})=>({id,name})),world:true});
+      if(this.store.call&&!this.presencePending){this.presencePending=true;this.store.call({op:'presence',players},1).then(r=>{for(const session of this.sessions.values())send(session.socket,{type:'presence',players:r.players,world:false});}).catch(()=>{}).finally(()=>this.presencePending=false);}
     }
     this.events();
   }
@@ -225,7 +246,7 @@ export class WorldRoom {
     const uid = this.attachments.get(socket)?.identity?.user?.id;
     this.enqueue(async () => {
       if (this.sessions.get(uid)?.socket === socket) {
-        await this.flushMutations(); this.game?.leave(uid); await this.durable(); this.sessions.delete(uid);
+        await this.flushMutations();this.sessions.get(uid)?.sim?.leave(uid); this.game?.leave(uid); await this.durable(); this.sessions.delete(uid);
         for (const session of this.sessions.values()) send(session.socket, { type: 'player.leave', id: uid });
       }
       if (!this.sessions.size && !this.pending.size) { clearInterval(this.timer); this.timer = null; this.onEmpty(); }
@@ -235,7 +256,7 @@ export class WorldRoom {
     if (this.closing) return; this.closing = true; clearInterval(this.timer); this.timer = null;
     try {
       await this.chain;
-      if (save && !this.failed) { while (this.mutations.length) await this.flushMutations(); for (const uid of this.sessions.keys()) this.game?.leave(uid); await this.durable(); }
+      if (save && !this.failed) { while (this.mutations.length) await this.flushMutations(); for (const [uid,s] of this.sessions){s.sim?.leave(uid);this.game?.leave(uid);} await this.durable(); }
     } finally {
       for (const session of this.sessions.values()) session.socket.close(1012, 'Server restarting; reconnect');
       for (const socket of this.pending) socket.close(1012, 'Server restarting; reconnect');

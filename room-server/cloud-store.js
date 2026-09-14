@@ -67,7 +67,7 @@ export class CloudStore {
       const value = fn(), combined = new Map([...this.pending, ...this.transactionWrites]);
       // Do not split inventory/world changes into partially committed batches.
       if (combined.size > 128 || Buffer.byteLength(JSON.stringify([...combined.values()])) > 490000) throw new Error('Atomic edit is too large');
-      for (const r of this.transactionWrites.values()) this.cache(r.kind, r.key, r.value);
+      for (const r of this.transactionWrites.values()) if(r.kind!=='audit')this.cache(r.kind, r.key, r.value);
       this.pending = combined; this.changeVersion++; return value;
     } finally { this.transactionWrites = null; }
   }
